@@ -3,6 +3,8 @@ use std::{borrow::Cow, fmt, fmt::Write, ops::Deref};
 use jslt_macro::expect_inner;
 use pest::iterators::Pairs;
 use serde_json::Value;
+use serde_json::json;   // ← add this
+
 
 use crate::{
   context::{Context, builtins::boolean_cast},
@@ -14,8 +16,6 @@ use crate::{
     expr::{ExprTransformer, ForTransformer},
   },
 };
-use crate::trace;
-
 
 #[derive(Debug)]
 pub struct PairTransformer(ExprTransformer, ExprTransformer);
@@ -87,100 +87,104 @@ impl FromPairs for ObjectTransformer {
 
 impl Transform for ObjectTransformer {
   fn transform_value(&self, context: Context<'_>, input: &Value) -> Result<Value> {
-    trace!("▶ ObjectTransformer::transform_value; input = {:?}", input);
     let mut items = serde_json::Map::new();
 
     for inner in &self.inner {
-      trace!("  ObjectTransformer inner variant = {:?}", inner);
       match inner {
-        ObjectTransformerInner::Pair(PairTransformer(key, value)) => {
-          trace!("    ▶ Object Pair; evaluating key");
-          let key = key.transform_value(Context::Borrowed(&context), input)?;
-           trace!("    key = {:?}", key);
+    // ────────────────────────────────────── ordinary  "key : value"  pair
+    ObjectTransformerInner::Pair(PairTransformer(key_expr, val_expr)) => {
+        // create ONE owned JsltContext we can mutate
+        let mut pair_ctx = context.clone();
+        println!("🔰 [Pair]  cloned vars (start) = {:#?}", pair_ctx.variables);
 
-          let key = key.as_str().ok_or_else(|| {
-            JsltError::RuntimeError(format!(
-              "expression outout for key should be a string but got {key}"
-            ))
-          })?;
-          trace!("    ▶ Object Pair; evaluating value for key `{}`", key);
-          let val = value.transform_value(Context::Borrowed(&context), input)?;
-          trace!("    value = {:?}", val);
+        // ─ key  (may contain `let …`)
+        let key_val = key_expr.transform_value(
+            Context::Borrowed(pair_ctx.to_mut()),   // same mutable ctx
+            input,
+        )?;
+        println!("🔰 [Pair]  after key  vars     = {:#?}", pair_ctx.variables);
 
-          items.insert(
-            key.to_owned(),
-            value.transform_value(Context::Borrowed(&context), input)?,
-          );
+        let key_str = key_val.as_str().ok_or_else(|| JsltError::RuntimeError(
+            format!("key must be string but got {key_val}")
+        ))?;
+        println!("🔰 [Pair]  key = {}", key_str);
+
+        // ─ value (reads the variable we just defined)
+        let val_val = val_expr.transform_value(
+            Context::Borrowed(pair_ctx.to_mut()),   // same mutable ctx
+            input,
+        )?;
+        println!("🔰 [Pair]  after value vars     = {:#?}", pair_ctx.variables);
+        println!("🔰 [Pair]  val = {:?}", val_val);
+
+        items.insert(key_str.to_owned(), val_val);
+    }
+
+    // ───────────────────────────────────────────────  for ( … )  pair
+    ObjectTransformerInner::For(ObjectForTransformer {
+        source,
+        output,
+        condition,
+    }) => {
+        let PairTransformer(key_expr, val_expr) = output.deref();
+
+        // evaluate collection we’re iterating
+        let src_val = source.transform_value(Context::Borrowed(&context), input)?;
+
+        let iter: Box<dyn Iterator<Item = Cow<Value>>> = if src_val.is_object() {
+            println!("🔁 [For]  iterating object: {:?}", src_val);
+            Box::new(src_val.as_object().unwrap().iter().map(|(k,v)| {
+                Cow::Owned(json!({ "key": k, "value": v }))
+            }))
+        } else if src_val.is_array() {
+            println!("🔁 [For]  iterating array: {:?}", src_val);
+            Box::new(src_val.as_array().unwrap().iter().map(Cow::Borrowed))
+        } else {
+            return Err(JsltError::RuntimeError(format!(
+                "Can iterate only arrays or objects (got {src_val})"
+            )));
+        };
+
+        for elem in iter {
+           // ONE owned context per element  (not a Cow!)
+          let mut pair_ctx_owned = (*context).clone();
+          println!("🔰 [ForPair] cloned vars (start) = {:#?}", pair_ctx_owned.variables);
+
+          // key
+          let key_val = key_expr.transform_value(
+              Context::Borrowed(&mut pair_ctx_owned),   // borrow the SAME ctx
+              &elem,
+          )?;
+          println!("🔰 [ForPair] after key  vars = {:#?}", pair_ctx_owned.variables);
+
+          let key_str = key_val.as_str().ok_or_else(|| JsltError::RuntimeError(
+              format!("key must be string but got {key_val}")
+          ))?;
+
+          // value
+          let val_val = val_expr.transform_value(
+              Context::Borrowed(&mut pair_ctx_owned),   // SAME ctx again
+              &elem,
+          )?;
+          println!("🔰 [ForPair] after value vars = {:#?}", pair_ctx_owned.variables);
+          println!("🔰 [ForPair] val = {:?}", val_val);
+
+          items.insert(key_str.to_owned(), val_val);
+
         }
-        ObjectTransformerInner::For(ObjectForTransformer {
-          source,
-          output,
-          condition,
-        }) => {
-          let PairTransformer(key, value) = output.deref();
-          trace!("    ▶ ObjectFor; evaluating source");
-          let source = source.transform_value(Context::Borrowed(&context), input)?;
-          trace!("    source produced = {:?}", source);
+    }
 
-          let input_iter: Box<dyn Iterator<Item = Cow<Value>>> = if source.is_object() {
-            Box::new(
-              source
-                .as_object()
-                .expect("Should be object")
-                .into_iter()
-                .map(|(key, value)| Cow::Owned(serde_json::json!({ "key": key, "value": value }))),
-            )
-          } else {
-            Box::new(
-              source
-                .as_array()
-                .expect("Should be array")
-                .iter()
-                .map(Cow::Borrowed),
-            )
-          };
 
-          for input in input_iter {
-            trace!("      For item = {:?}", input);
-            if let Some(condition) = condition {
-              trace!("        ▶ ObjectFor condition");
-              let cond_val = condition.transform_value(Context::Borrowed(&context), &input)?;
-              trace!("        condition → {:?}", cond_val);
-              if !boolean_cast(&condition.transform_value(Context::Borrowed(&context), &input)?) {
-                trace!("        condition false; skipping");
-                continue;
-              }
-            }
 
-            let key = key.transform_value(Context::Borrowed(&context), &input)?;
-            //  trace!("        key =);
-
-            let key = key.as_str().ok_or_else(|| {
-              JsltError::RuntimeError(format!(
-                "expression outout for key should be a string but got {key}"
-              ))
-            })?;
-
-            items.insert(
-              key.to_owned(),
-              value.transform_value(Context::Borrowed(&context), &input)?,
-            );
-          }
-        }
         ObjectTransformerInner::Spread(expr) => {
           let source = input.as_object().ok_or_else(|| {
             JsltError::RuntimeError(format!("object spread expected and object but got {input}"))
           })?;
 
           for key in source.keys() {
-            trace!("      considering spread key = {}", key);
             if items.contains_key(key) {
-              trace!("      already has key; skipping");
               continue;
             }
-            trace!("      ▶ spreading key `{}`", key);
-            let v = expr.transform_value(Context::Borrowed(&context), &source[key])?;
-            trace!("      spread value = {:?}", v);
 
             items.insert(
               key.clone(),
@@ -190,7 +194,6 @@ impl Transform for ObjectTransformer {
         }
       }
     }
-    trace!("◀ ObjectTransformer::transform_value ⇒ {:?}", items);
 
     Ok(Value::Object(items))
   }

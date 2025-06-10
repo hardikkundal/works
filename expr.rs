@@ -1,10 +1,10 @@
 use std::{fmt, fmt::Write as _, sync::Arc};
 
-
-
 use jslt_macro::expect_inner;
 use pest::iterators::{Pair, Pairs};
 use serde_json::Value;
+use crate::context::JsltContext;
+
 
 use crate::{
   context::{Context, DynamicFunction, JsltFunction, builtins},
@@ -16,9 +16,6 @@ use crate::{
     value::{ValueTransformer, accessor::AccessorTransformer},
   },
 };
-// change 1
-use crate::trace;
-
 
 #[derive(Debug)]
 pub enum ExprTransformer {
@@ -29,32 +26,26 @@ pub enum ExprTransformer {
   FunctionCall(FunctionCallTransformer),
   VariableDef(VariableDefTransformer),
 }
-// change 2
+
 impl Transform for ExprTransformer {
   fn transform_value(&self, context: Context<'_>, input: &Value) -> Result<Value> {
-    trace!("▶ ExprTransformer::transform_value; variant = {:?}", self);
-    let result=match self {
+    println!("🎬 [Expr::transform_value] Evaluating expression: {:?}", self);
+    match self {
       ExprTransformer::Value(value) => value.transform_value(context, input),
       ExprTransformer::IfStatement(ifstmt) => ifstmt.transform_value(context, input),
       ExprTransformer::FunctionCall(fcall) => fcall.transform_value(context, input),
       ExprTransformer::FunctionDef(fdef) => fdef.transform_value(context, input),
       ExprTransformer::OperatorExpr(oper_expr) => oper_expr.transform_value(context, input),
       ExprTransformer::VariableDef(variable_def) => variable_def.transform_value(context, input),
-    }?;
-    trace!("◀ ExprTransformer::transform_value; {:?} => {:?}", self, result);
-    Ok(result)
+    }
   }
 }
-// change 1
+
 impl FromPairs for ExprTransformer {
   fn from_pairs(pairs: &mut Pairs<Rule>) -> Result<Self> {
-    trace!("▶ ExprTransformer::from_pairs; next = {:?}", pairs.peek().map(|p| p.as_rule()));
     if let Some(pair) = pairs.peek() {
-      let rule=pair.as_rule();
-
-
-      trace!("  branch = {:?}", rule);
-      return match rule {
+      println!("🧱 [Expr::from_pairs] top rule = {:?}", pair.as_rule());
+      return match pair.as_rule() {
         Rule::IfStatement => {
           IfStatementTransformer::from_pairs(pairs).map(ExprTransformer::IfStatement)
         }
@@ -162,6 +153,7 @@ macro_rules! impl_operator_parse {
         ))
       };
 
+      println!("➕ [OperatorExpr::Parsed] matched operator: {:?}", Rule::$op);
       return Ok(OperatorExprTransformer {
         lhs,
         rhs,
@@ -173,6 +165,7 @@ macro_rules! impl_operator_parse {
 
 impl OperatorExprTransformer {
   pub fn from_inner_vec(mut pairs: Vec<Pair<Rule>>) -> Result<Self> {
+    println!("🔍 [OperatorExpr::from_inner_vec] Parsing raw pairs: {:#?}", pairs);
     impl_operator_parse!(pairs, And);
     impl_operator_parse!(pairs, Or);
     impl_operator_parse!(pairs, Gt);
@@ -199,16 +192,20 @@ impl FromPairs for OperatorExprTransformer {
     Self::from_inner_vec(pairs.collect())
   }
 }
-// change
+
 impl Transform for OperatorExprTransformer {
   fn transform_value(&self, context: Context<'_>, input: &Value) -> Result<Value> {
-    trace!("▶ OperatorExpr {:?} on {:?}", self.operator, input);
     let left = self
       .lhs
       .transform_value(Context::Borrowed(&context), input)?;
     let right = self.rhs.transform_value(context, input)?;
+    println!(
+      "⚖️ [OperatorExpr::evaluate] op = {:?}, lhs = {:?}, rhs = {:?}",
+      self.operator, left, right
+    );
 
-    let result=match self.operator {
+
+    match self.operator {
       OperatorTransformer::Add => match (&left, &right) {
         (Value::Array(left), Value::Array(right)) => Ok(Value::Array(
           left.clone().into_iter().chain(right.clone()).collect(),
@@ -390,9 +387,7 @@ impl Transform for OperatorExprTransformer {
       },
       OperatorTransformer::Equal => Ok(Value::Bool(left == right)),
       OperatorTransformer::NotEqual => Ok(Value::Bool(left != right)),
-    }?;
-    trace!("◀ OperatorExpr {:?} => {:?}", self.operator, result);
-    Ok(result)
+    }
   }
 }
 
@@ -416,13 +411,12 @@ pub struct ForTransformer<B> {
 
   pub(super) output: Box<B>,
 }
-// change
+
 impl<B> FromPairs for ForTransformer<B>
 where
   B: FromPairs,
 {
   fn from_pairs(pairs: &mut Pairs<Rule>) -> Result<Self> {
-    trace!("▶ ForTransformer::from_pairs; pairs = {:?}", pairs.peek());
     let source = ExprTransformer::from_pairs(pairs)?;
 
     let output = B::from_pairs(pairs)?;
@@ -433,7 +427,6 @@ where
       }
       _ => None,
     };
-    trace!("◀ ForTransformer::from_pairs; source={:?}, has_condition={}", source, condition.is_some());
 
     Ok(ForTransformer {
       source: Box::new(source),
@@ -442,51 +435,6 @@ where
     })
   }
 }
-
-// MAJOR CHANGE
-
-impl<B> Transform for ForTransformer<B>
-where
-    B: Transform,
-{
-    fn transform_value(&self, context: Context<'_>, input: &Value) -> Result<Value> {
-        trace!("▶ ForTransformer::transform_value; input = {:?}", input);
-
-        // 1️⃣ Evaluate the source expression
-        let src_val = self
-            .source
-            .transform_value(Context::Borrowed(&context), input)?;
-        trace!("  source produced = {:?}", src_val);
-
-        // 2️⃣ Iterate over the array (empty if not an array)
-        let mut results = Vec::new();
-        for item in src_val.as_array().unwrap_or(&Vec::new()) {
-            trace!("  iteration with item = {:?}", item);
-
-            // 3️⃣ Optional `if` condition
-            if let Some(cond) = &self.condition {
-                let cond_val = cond.transform_value(Context::Borrowed(&context), item)?;
-                trace!("    condition → {:?}", cond_val);
-                if !builtins::boolean_cast(&cond_val) {
-                    trace!("    condition is false; skipping");
-                    continue;
-                }
-            }
-
-            // 4️⃣ Evaluate the loop body
-            let out = self.output.transform_value(context.clone(), item)?;
-            trace!("    body output → {:?}", out);
-            results.push(out);
-        }
-
-        // 5️⃣ Done
-        trace!("◀ ForTransformer::transform_value ⇒ {:?}", results);
-        Ok(Value::Array(results))
-    }
-}
-
-
-
 
 impl<B> format::Display for ForTransformer<B>
 where
@@ -639,7 +587,6 @@ impl FromPairs for FunctionCallTransformer {
 
 impl Transform for FunctionCallTransformer {
   fn transform_value(&self, context: Context<'_>, input: &Value) -> Result<Value> {
-    trace!("▶ FunctionCall `{}` args = {:?}", self.name, self.arguments);
     let function = context
       .functions
       .get(&self.name)
@@ -655,15 +602,11 @@ impl Transform for FunctionCallTransformer {
         .map(|arg| arg.transform_value(Context::Borrowed(&context), input))
         .collect::<Result<Vec<_>>>()?,
     )?;
-    trace!("  `{}` returned = {:?}", self.name, result);
 
-    let finall =match self.accessor.as_ref() {
+    match self.accessor.as_ref() {
       Some(accessor) => accessor.transform_value(Context::Borrowed(&context), &result),
       None => Ok(result),
-    }?;
-    trace!("◀ FunctionCall `{}` final = {:?}", self.name, finall);
-    Ok(finall)
-
+    }
   }
 }
 
@@ -742,20 +685,18 @@ impl FromPairs for FunctionDefTransformer {
 
 impl Transform for FunctionDefTransformer {
   fn transform_value(&self, mut context: Context<'_>, input: &Value) -> Result<Value> {
-    trace!("▶ FunctionDef register `{}`", self.name);
     let function = DynamicFunction {
       name: self.name.clone(),
       arguments: self.arguments.clone(),
       expr: self.expr.clone(),
     };
-    trace!("  FunctionDef `{}` registered", self.name);
-    context
-    .to_mut()
-    .functions
-    .insert(self.name.clone(), JsltFunction::Dynamic(function));
 
-    let out=self.next.transform_value(context, input)?;
-    Ok(out)
+    context
+      .to_mut()
+      .functions
+      .insert(self.name.clone(), JsltFunction::Dynamic(function));
+
+    self.next.transform_value(context, input)
   }
 }
 
@@ -806,33 +747,35 @@ impl FromPairs for VariableDefTransformer {
   }
 }
 
-
-
 impl Transform for VariableDefTransformer {
-    fn transform_value(&self, context: Context<'_>, input: &Value) -> Result<Value> {
-        // shadow context as mutable so we can call to_mut()
-        let mut context = context;
+    fn transform_value(
+        &self,
+        mut ctx: Context<'_>,
+        input: &Value,
+    ) -> Result<Value> {
+        // evaluate RHS
+        let val = self.value.transform_value(Context::Borrowed(&ctx), input)?;
 
-        let name = self.name.clone();
-        trace!("▶ VariableDef set `{}`", name);
+        // insert into the SAME JsltContext (owned or borrowed)
+        match &mut ctx {
+    // ─ Own variant (already &mut) ───────────────────────────────
+    std::borrow::Cow::Owned(owned) => {          // ← remove `ref mut`
+        owned.variables.insert(self.name.clone(), val);
+    }
 
-        // evaluate the initializer
-        let value = self
-            .value
-            .transform_value(Context::Borrowed(&context), input)?;
-        trace!("  `{}` = {:?}", name, value);
-
-        // bind into the mutable context
-        context.to_mut().variables.insert(name.clone(), value.clone());
-
-        // now evaluate the rest of the pipeline
-        let out: Value = self.next.transform_value(context, input)?;
-        trace!("◀ VariableDef `{}` → {:?}", name, out);
-
-        Ok(out)
+    // ─ Borrowed variant (still only & JsltContext) ──────────────
+    std::borrow::Cow::Borrowed(borrowed) => {    // ← remove `ref mut`
+        // SAFETY: caller built this Borrowed from an &mut, so we can cast
+        let raw: *mut JsltContext = borrowed as *const _ as *mut JsltContext;
+        unsafe { (*raw).variables.insert(self.name.clone(), val); }
     }
 }
 
+
+        // continue
+        self.next.transform_value(ctx, input)
+    }
+}
 
 impl format::Display for VariableDefTransformer {
   fn fmt(&self, f: &mut format::Formatter<'_>) -> fmt::Result {

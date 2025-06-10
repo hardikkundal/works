@@ -6,7 +6,7 @@ use crate::{
   error::Result,
   transform::{Transform, expr::ExprTransformer},
 };
-use crate::trace;
+
 pub(crate) mod builtins;
 
 #[derive(Clone)]
@@ -17,21 +17,10 @@ pub enum JsltFunction {
 
 impl JsltFunction {
   pub fn call(&self, context: Context<'_>, input: &Value, arguments: &[Value]) -> Result<Value> {
-    trace!("▶ JsltFunction::call; variant = {:?}, args = {:?}", self, arguments);
-    let res=match self {
-      JsltFunction::Static(function) =>{
-        trace!("  invoking Static builtin");
-        function(arguments)
-      }
-        
-      JsltFunction::Dynamic(function) => 
-      { 
-        trace!("  invoking DynamicFunction `{}`", function.name);
-        function.call(context, input, arguments)
-      }
-    }?;
-    trace!("◀ JsltFunction::call ⇒ {:?}", res);
-    Ok(res)
+    match self {
+      JsltFunction::Static(function) => function(arguments),
+      JsltFunction::Dynamic(function) => function.call(context, input, arguments),
+    }
   }
 }
 
@@ -58,22 +47,15 @@ impl DynamicFunction {
     input: &Value,
     arguments: &[Value],
   ) -> Result<Value> {
-    trace!("▶ DynamicFunction::call `{}`; raw args = {:?}", self.name, arguments);
-
     let arguments = self
       .arguments
       .iter()
       .zip(arguments)
       .map(|(name, value)| (name.clone(), value.clone()));
 
-    trace!("  binding args = {:?}", arguments);
-
     context.to_mut().variables.extend(arguments);
 
-    let result=self.expr.transform_value(context, input)?;
-    trace!("◀ DynamicFunction::call `{}` ⇒ {:?}", self.name, result);
-    Ok(result)
-
+    self.expr.transform_value(context, input)
   }
 }
 
@@ -94,11 +76,8 @@ pub struct JsltContext {
 
 impl Default for JsltContext {
   fn default() -> Self {
-    trace!("▶ JsltContext::default: initializing context");
     let mut functions = HashMap::default();
     let variables = HashMap::default();
-
-    trace!("  before registering builtins: functions={}, variables={}", functions.len(), variables.len());
 
     include_builtin!(functions, contains);
     include_builtin!(functions, size);
@@ -150,14 +129,11 @@ impl Default for JsltContext {
     include_builtin!(functions, parse_time, "parse-time");
     include_builtin!(functions, format_time, "format-time");
     include_builtin!(functions, parse_url, "parse-url");
-    trace!("  registered builtins: {}", functions.len());
 
-    let ctx=JsltContext {
+    JsltContext {
       functions,
       variables,
-    };
-    trace!("◀ JsltContext::default ⇒ {:?}", ctx);
-    ctx
+    }
   }
 }
 
