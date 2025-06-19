@@ -1,0 +1,5 @@
+tests:
+- name: testExceptionWithNoLocation
+  query: contains(2, 2)
+  input: {}
+  expected_error: regular expression
